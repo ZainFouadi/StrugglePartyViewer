@@ -128,6 +128,8 @@ main{max-width:1040px;margin:12px auto 0}
 /* ---------- companies ---------- */
 .co{display:flex;gap:10px;align-items:center;padding:8px 10px;margin-bottom:5px}
 .co>.wt-ic{font-size:19px;color:#C4C581}
+.co-img{width:34px;height:34px;object-fit:contain;flex:none}
+.co-n{color:var(--faint);font-weight:400;font-size:11px;margin-left:6px}
 .co-b{flex:1;min-width:0}
 .co-t{font-size:12.5px}
 .co-s{display:flex;gap:10px;flex-wrap:wrap;font-size:10.8px;color:var(--muted);font-weight:400;margin-top:2px}
