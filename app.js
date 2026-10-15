@@ -130,11 +130,21 @@
     return custom ? [custom] : CFG.defaultBases;
   }
 
+  // Some tRPC servers wrap data as {json: ...} (superjson). Unwrap it transparently.
+  const unwrap = (d) => (d && typeof d === "object" && !Array.isArray(d) && "json" in d && Object.keys(d).every((k) => k === "json" || k === "meta")) ? d.json : d;
+
+  const LOG = []; // last API calls, shown in the diagnostics report
+  function logCall(proc, base, status, t0, err) {
+    LOG.push({ at: new Date().toISOString(), proc, base, status, ms: Math.round(performance.now() - t0), err: err || "" });
+    if (LOG.length > 40) LOG.shift();
+  }
+
   async function call(proc, input) {
     const token = getToken();
     if (!token) throw new ApiError("auth", "No token");
     let last;
     for (const base of bases()) {
+      const t0 = performance.now();
       try {
         const res = await fetch(`${base}/trpc/${proc}?batch=1`, {
           method: "POST",
@@ -142,7 +152,8 @@
           body: JSON.stringify({ "0": input || {} }),
         });
         let json;
-        try { json = await res.json(); } catch (e) { throw new ApiError("api", `${proc}: HTTP ${res.status}`); }
+        try { json = await res.json(); } catch (e) { logCall(proc, base, res.status, t0, "non-JSON body"); throw new ApiError("api", `${proc}: HTTP ${res.status}`); }
+        logCall(proc, base, res.status, t0);
         const first = Array.isArray(json) ? json[0] : json;
         if (first && first.error) {
           const msg = (first.error.json && first.error.json.message) || first.error.message || "API error";
@@ -150,9 +161,10 @@
           throw new ApiError(res.status === 401 || /UNAUTH/i.test(code) ? "auth" : "api", `${proc}: ${msg}`);
         }
         if (res.status === 401) throw new ApiError("auth", "Unauthorized");
-        if (first && first.result && "data" in first.result) return first.result.data;
-        return first;
+        if (first && first.result && "data" in first.result) return unwrap(first.result.data);
+        return unwrap(first);
       } catch (e) {
+        if (!(e instanceof ApiError)) logCall(proc, base, 0, t0, String(e && e.message || e));
         if (e instanceof ApiError) { if (e.kind !== "net") throw e; last = e; }
         else last = new ApiError("net", "Network request failed (blocked by CORS, offline, or wrong API address)");
       }
@@ -208,6 +220,9 @@
       progress(0, 1, "Loading party...");
       const party = await retry(() => call("party.getById", { partyId: CFG.partyId }));
       S.party = party;
+      if (!party || !Array.isArray(party.members)) {
+        throw new ApiError("api", "Unexpected party response (no members list). Keys: " + (party && typeof party === "object" ? Object.keys(party).join(", ") || "none" : typeof party) + ". Open Diagnostics (Ctrl+Shift+D) and copy the report.");
+      }
       S.roles = new Map();
       (party.members || []).forEach((id) => S.roles.set(id, { leader: false, treasurer: false, council: false }));
       const mark = (id, k) => { if (!S.roles.has(id)) S.roles.set(id, { leader: false, treasurer: false, council: false }); S.roles.get(id)[k] = true; };
@@ -586,6 +601,216 @@
       if ((e.key === "Enter" || e.key === " ") && e.target.classList.contains("pl-h")) { e.preventDefault(); toggle(e.target.parentElement); }
     });
   }
+
+
+  // ---------------------------------------------------------------- hidden diagnostics
+  // Open with: Ctrl+Shift+D, or add ?diag to the URL, or click the footer text 3 times.
+  const shape = (v, depth = 0) => {
+    if (v === null) return "null";
+    if (Array.isArray(v)) return `array(${v.length})` + (v.length && depth < 1 ? " of " + shape(v[0], depth + 1) : "");
+    if (typeof v === "object") { const k = Object.keys(v); return depth < 1 ? `{${k.slice(0, 25).join(", ")}${k.length > 25 ? ", ..." : ""}}` : `object(${k.length} keys)`; }
+    return typeof v;
+  };
+  const cut = (t, n) => { t = String(t == null ? "" : t); return t.length > n ? t.slice(0, n) + `... [+${t.length - n} chars]` : t; };
+
+  async function rawProbe(base, proc, input, token) {
+    const t0 = performance.now();
+    const out = { base, proc, input: JSON.stringify(input) };
+    try {
+      const res = await fetch(`${base}/trpc/${proc}?batch=1`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token },
+        body: JSON.stringify({ "0": input }),
+      });
+      out.status = res.status;
+      out.ms = Math.round(performance.now() - t0);
+      out.contentType = res.headers.get("content-type") || "-";
+      out.text = await res.text();
+      try { out.json = JSON.parse(out.text); } catch (e) { out.parseError = String(e.message || e); }
+    } catch (e) {
+      out.ms = Math.round(performance.now() - t0);
+      out.netError = String((e && e.message) || e);
+    }
+    return out;
+  }
+
+  function describe(r) {
+    const L = [];
+    L.push(`- request : POST ${r.base}/trpc/${r.proc}?batch=1   body {"0":${r.input}}`);
+    if (r.netError) { L.push(`- RESULT  : NETWORK ERROR after ${r.ms}ms -> ${r.netError}`); return { text: L.join("\n"), data: null }; }
+    L.push(`- HTTP    : ${r.status} (${r.ms}ms), content-type ${r.contentType}`);
+    if (r.parseError) { L.push(`- RESULT  : body is not JSON (${r.parseError})`); L.push(`- raw     : ${cut(r.text, 500)}`); return { text: L.join("\n"), data: null }; }
+    const first = Array.isArray(r.json) ? r.json[0] : r.json;
+    L.push(`- envelope: ${Array.isArray(r.json) ? "array(" + r.json.length + ")" : typeof r.json} -> first = ${shape(first)}`);
+    if (first && first.error) {
+      const e = first.error;
+      L.push(`- RESULT  : API ERROR -> ${(e.json && e.json.message) || e.message || "?"} | code ${(e.json && e.json.data && e.json.data.code) || (e.data && e.data.code) || "?"}`);
+      L.push(`- raw     : ${cut(r.text, 500)}`);
+      return { text: L.join("\n"), data: null };
+    }
+    let data = first && first.result ? first.result.data : first;
+    const wrapped = data && typeof data === "object" && "json" in data;
+    if (wrapped) L.push(`- note    : data is wrapped in {json: ...} (the app unwraps this automatically)`);
+    data = unwrap(data);
+    L.push(`- data    : ${shape(data)}`);
+    L.push(`- raw     : ${cut(r.text, 420)}`);
+    return { text: L.join("\n"), data };
+  }
+
+  async function runDiagnostics(setOut) {
+    const R = [];
+    const add = (s) => { R.push(s); setOut(R.join("\n")); };
+    const head = (s) => add(`\n=== ${s} ===`);
+    const token = getToken();
+    add("WarEra Party Roster - diagnostics report");
+    add("Generated: " + new Date().toISOString());
+
+    head("1. Environment");
+    add("page      : " + location.href);
+    add("origin    : " + location.origin + (location.protocol === "file:" ? "   (file:// - browsers usually block API calls from here; use GitHub Pages or a local server)" : ""));
+    add("userAgent : " + navigator.userAgent);
+    add("online    : " + navigator.onLine);
+    add("language  : " + navigator.language);
+    let ls = "ok"; try { localStorage.setItem("__t", "1"); localStorage.removeItem("__t"); } catch (e) { ls = "BLOCKED (" + e.message + ")"; }
+    add("localStorage: " + ls);
+    add("partyId   : " + CFG.partyId);
+    add("api bases : " + bases().join(" , ") + (store.get(LS.base, "") ? "   (custom)" : "   (default)"));
+    if (!token) add("token     : MISSING");
+    else {
+      let exp = "unknown", alg = "?", keys = "?";
+      try {
+        const [h, p] = token.split(".");
+        const dec = (x) => JSON.parse(atob(x.replace(/-/g, "+").replace(/_/g, "/")));
+        alg = dec(h).alg; const pl = dec(p); keys = Object.keys(pl).join(", ");
+        if (pl.exp) exp = new Date(pl.exp * 1000).toISOString() + (Date.now() > pl.exp * 1000 ? "  <-- EXPIRED" : "  (valid)");
+      } catch (e) { exp = "not a decodable JWT"; }
+      add(`token     : present, ${token.length} chars, alg ${alg}, payload keys [${keys}], exp ${exp}   (value is never printed)`);
+    }
+    if (!token) { add("\nStop: no token saved. Save one with the key button, then re-run."); return R.join("\n"); }
+
+    head("2. Can the browser reach the API? (CORS vs network)");
+    for (const base of bases()) {
+      let reach;
+      try { await fetch(base + "/", { mode: "no-cors" }); reach = "reachable (opaque response)"; } catch (e) { reach = "NOT reachable: " + (e.message || e); }
+      add(`${base}  no-cors ping -> ${reach}`);
+    }
+
+    // pick first base that answers party.getById
+    let party = null, base = null;
+    head("3. party.getById");
+    for (const b of bases()) {
+      const r = await rawProbe(b, "party.getById", { partyId: CFG.partyId }, token);
+      const d = describe(r);
+      add(`[${b}]\n${d.text}`);
+      if (d.data) { party = d.data; base = b; break; }
+    }
+    if (!party) {
+      add("\nVERDICT: party request failed.");
+      add("  - 'NETWORK ERROR' while the ping above says reachable  => CORS block: deploy worker.js and set API base.");
+      add("  - HTTP 401 / UNAUTHORIZED => token invalid or expired.");
+      return R.join("\n");
+    }
+    const mem = party.members;
+    add("\nparsed:");
+    add(`- name        : ${party.name}`);
+    add(`- members     : ${Array.isArray(mem) ? mem.length : "MISSING (" + typeof mem + ")"}`);
+    add(`- councilMembers: ${Array.isArray(party.councilMembers) ? party.councilMembers.length : "MISSING"}`);
+    add(`- leader      : ${party.leader || "MISSING"}`);
+    add(`- treasurer   : ${party.treasurer || "MISSING"}`);
+    add(`- member id sample type: ${mem && mem.length ? typeof mem[0] + (typeof mem[0] === "object" ? " " + shape(mem[0]) : "") : "-"}`);
+    if (!Array.isArray(mem) || !mem.length) { add("\nVERDICT: party has no usable members array - the app cannot list players. Send this report."); return R.join("\n"); }
+
+    const sampleId = typeof mem[0] === "object" ? (mem[0]._id || mem[0].id) : mem[0];
+    head("4. user.getUserById (first member: " + sampleId + ")");
+    const ru = await rawProbe(base, "user.getUserById", { userId: sampleId }, token);
+    const du = describe(ru); add(du.text);
+    const u = du.data;
+    let muId = null, coUser = sampleId;
+    if (u) {
+      const sk = u.skills || {};
+      const want = ["username", "avatarUrl", "mu", "leveling.level", "leveling.totalXp", "leveling.spentSkillPoints", "dates.lastConnectionAt", "stats.wealth.total", "stats.wealth.money", "stats.wealth.companies", "stats.wealth.items", "stats.wealth.equipments", "stats.wealth.weapons"];
+      const get = (o, path) => path.split(".").reduce((a, k) => (a == null ? undefined : a[k]), o);
+      add("\nfields the app uses:");
+      want.forEach((w) => { const v = get(u, w); add(`- ${w.padEnd(26)}: ${v === undefined ? "MISSING" : v === null ? "null" : cut(typeof v === "object" ? JSON.stringify(v) : v, 60)}`); });
+      add("skills (level / total):");
+      SKILLS.forEach((s) => { const d = sk[s.k]; add(`- ${s.k.padEnd(17)}: ${d ? `level ${d.level} / total ${d.total} / value ${d.value}` : "MISSING"}`); });
+      const cls = classify(u);
+      add(`classification: ${cls.type} (combat pts ${cls.c}, economic pts ${cls.e}, combat share ${Math.round(cls.share * 100)}%)`);
+      muId = u.mu || null;
+    }
+
+    head("5. mu.getById" + (muId ? " (" + muId + ")" : ""));
+    if (!muId) add("first member has no MU - skipped (the app shows 'No MU').");
+    else { const d = describe(await rawProbe(base, "mu.getById", { muId }, token)); add(d.text); if (d.data) add("parsed name: " + d.data.name); }
+
+    head("6. company.getCompanies + company.getProductionBonus");
+    const rc = describe(await rawProbe(base, "company.getCompanies", { userId: coUser, perPage: CFG.companiesPerPage }, token));
+    add(rc.text);
+    const items = rc.data && rc.data.items;
+    if (!Array.isArray(items)) add("items: MISSING or not an array");
+    else if (!items.length) add("items: empty (first member has no companies)");
+    else {
+      add(`items: ${items.length}, first item type ${typeof items[0]}${typeof items[0] === "object" ? " " + shape(items[0]) : ""}`);
+      const cid = typeof items[0] === "object" ? (items[0]._id || items[0].id) : items[0];
+      const rb = describe(await rawProbe(base, "company.getProductionBonus", { companyId: cid }, token)); add(rb.text);
+    }
+
+    head("7. App state");
+    add(`loading=${S.loading}, lastOk=${S.lastOk ? new Date(S.lastOk).toISOString() : "never"}, players in memory=${S.players.size}, roles=${S.roles.size}, MU names cached=${Object.keys(S.mu).length}`);
+    const bad = Array.from(S.players.values()).filter((p) => p.error);
+    add(`players that failed to load: ${bad.length}`);
+    bad.slice(0, 8).forEach((p) => add(`  - ${p.id}: ${p.error}`));
+    add(`filters: ${JSON.stringify(S.f)}`);
+    add(`open rows: ${S.open.size}`);
+
+    head("8. Recent API calls made by the app (newest last)");
+    if (!LOG.length) add("(none yet)");
+    LOG.slice(-25).forEach((l) => add(`${l.at.slice(11, 19)}  ${String(l.status).padStart(3)}  ${String(l.ms).padStart(5)}ms  ${l.proc}${l.err ? "  ERR " + l.err : ""}`));
+    const stat = {}; LOG.forEach((l) => { stat[l.status] = (stat[l.status] || 0) + 1; });
+    add("status counts: " + JSON.stringify(stat));
+
+    add("\n=== end of report ===");
+    return R.join("\n");
+  }
+
+  function openDiagnostics() {
+    const ov = $("modal");
+    ov.innerHTML = `<div class="ov" id="dgBg"><div class="box dg" role="dialog" aria-modal="true" aria-label="Diagnostics">
+<h2>${ic("warn")}Diagnostics</h2>
+<p>Runs a few test requests and prints what the API returns. Your token is never included. Press Copy and paste the text to whoever is helping you.</p>
+<textarea id="dgOut" class="in dg-out" readonly spellcheck="false">Running...</textarea>
+<div class="row"><button class="btn" type="button" id="dgRun">${ic("refresh")}Run again</button><button class="btn pri" type="button" id="dgCopy">Copy report</button><button class="btn" type="button" id="dgClose">Close</button></div>
+</div></div>`;
+    const out = $("dgOut");
+    const close = () => { ov.innerHTML = ""; };
+    let busy = false;
+    const run = async () => {
+      if (busy) return; busy = true; $("dgRun").disabled = true; out.value = "Running...";
+      try { out.value = await runDiagnostics((t) => { out.value = t; out.scrollTop = out.scrollHeight; }); }
+      catch (e) { out.value += "\n\nDIAGNOSTICS CRASHED: " + ((e && e.stack) || e); }
+      busy = false; $("dgRun").disabled = false;
+    };
+    $("dgRun").onclick = run;
+    $("dgClose").onclick = close;
+    $("dgBg").addEventListener("mousedown", (e) => { if (e.target.id === "dgBg") close(); });
+    $("dgCopy").onclick = async () => {
+      const b = $("dgCopy");
+      try { await navigator.clipboard.writeText(out.value); }
+      catch (e) { out.removeAttribute("readonly"); out.select(); document.execCommand("copy"); out.setAttribute("readonly", ""); }
+      b.textContent = "Copied!"; setTimeout(() => { b.textContent = "Copy report"; }, 1500);
+    };
+    run();
+  }
+
+  document.addEventListener("keydown", (e) => {
+    if (e.ctrlKey && e.shiftKey && (e.key === "D" || e.key === "d")) { e.preventDefault(); openDiagnostics(); }
+  });
+  (() => { // 3 quick clicks on the footer text
+    let n = 0, t = 0;
+    const f = document.querySelector(".foot");
+    if (f) f.addEventListener("click", () => { const now = Date.now(); n = now - t < 700 ? n + 1 : 1; t = now; if (n >= 3) { n = 0; openDiagnostics(); } });
+  })();
+  if (PARAMS.has("diag")) setTimeout(openDiagnostics, 300);
 
   // ---------------------------------------------------------------- start
   bind();
