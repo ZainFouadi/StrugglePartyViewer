@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>حزب النضال الوطني — Party Roster</title>
+<meta name="description" content="WarEra party roster: skills, wealth, companies, MU and activity of every member.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Saira:wght@400;600;700&family=Reem+Kufi:wght@600;700&family=Cairo:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="hero">
+  <div class="hero-av"><img id="pAvatar" alt="" hidden></div>
+  <h1 id="pName" dir="rtl" lang="ar">حزب النضال الوطني</h1>
+  <p id="pDesc" class="hero-desc" dir="rtl" lang="ar"></p>
+  <div id="stats" class="wt-g stats"></div>
+</header>
+
+<section class="bar" aria-label="Filters">
+  <div class="bar-row">
+    <label class="fld grow"><span>Search</span><input id="fSearch" class="in" type="search" placeholder="Player name..." autocomplete="off"></label>
+    <label class="fld"><span>MU</span><select id="fMu" class="in"></select></label>
+    <label class="fld"><span>Sort by</span><select id="fSort" class="in">
+      <option value="level">Level (high to low)</option>
+      <option value="seen">Last connection</option>
+      <option value="wealth">Wealth</option>
+      <option value="name">Name (A-Z)</option>
+    </select></label>
+  </div>
+  <div class="bar-row">
+    <div id="fType" class="seg" role="group" aria-label="Player type"></div>
+    <div class="spacer"></div>
+    <div id="upd" class="upd"></div>
+    <button id="btnLoadCo" class="btn" type="button" title="Fetch companies and bonuses for every player"></button>
+    <button id="btnRefresh" class="btn pri" type="button"></button>
+    <button id="btnToken" class="btn ib" type="button" title="JWT token / connection settings"></button>
+  </div>
+  <div id="prog" class="prog" hidden><i></i><span></span></div>
+</section>
+
+<div id="notice"></div>
+
+<main>
+  <div class="cols" aria-hidden="true">
+    <span></span><span></span><span>Player</span><span>MU</span><span>Type</span><span>Last seen</span><span>Wealth</span>
+  </div>
+  <div id="list"></div>
+</main>
+
+<footer class="foot">Unofficial fan tool · data from the WarEra API · auto-refresh every 10 min</footer>
+
+<div id="modal"></div>
+<script src="app.js"></script>
+</body>
+</html>
