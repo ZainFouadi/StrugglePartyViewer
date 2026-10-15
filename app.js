@@ -7,7 +7,7 @@
   const CFG = {
     partyId: PARAMS.get("party") || "6a73c35d9b7e078fa6f4c1dc",
     refreshMs: 10 * 60 * 1000,
-    concurrency: 6,
+    concurrency: 4,
     companiesPerPage: 15,
     onlineMins: 15,
     muTtlMs: 24 * 60 * 60 * 1000,
@@ -172,11 +172,11 @@
     throw last;
   }
 
-  async function retry(fn, tries = 2) {
+  async function retry(fn, tries = 3) {
     let err;
     for (let i = 0; i < tries; i++) {
       try { return await fn(); }
-      catch (e) { err = e; if (e.kind === "auth") throw e; await new Promise((r) => setTimeout(r, 400 * (i + 1))); }
+      catch (e) { err = e; if (e.kind === "auth") throw e; await new Promise((r) => setTimeout(r, 700 * (i + 1))); }
     }
     throw err;
   }
@@ -205,8 +205,47 @@
     loading: false,
     lastOk: 0,
     lastStart: 0,
-    bulkCo: null,
+    cachedAt: 0,
   };
+
+  // ---------------------------------------------------------------- cache (survives page reloads)
+  const CACHE_KEY = "wr_cache_" + CFG.partyId;
+  function slimUser(u) {
+    const sk = {};
+    Object.keys(u.skills || {}).forEach((k) => { const d = u.skills[k] || {}; sk[k] = { level: d.level, value: d.value, total: d.total, weapon: d.weapon, equipment: d.equipment }; });
+    const l = u.leveling || {};
+    return { _id: u._id, username: u.username, avatarUrl: u.avatarUrl, mu: u.mu || null,
+      leveling: { level: l.level, totalXp: l.totalXp, spentSkillPoints: l.spentSkillPoints, availableSkillPoints: l.availableSkillPoints },
+      dates: { lastConnectionAt: u.dates && u.dates.lastConnectionAt }, skills: sk, stats: { wealth: (u.stats && u.stats.wealth) || {} } };
+  }
+  let saveT = 0;
+  function saveCache() {
+    clearTimeout(saveT);
+    saveT = setTimeout(() => {
+      if (!S.party) return;
+      try {
+        const players = [];
+        S.players.forEach((p) => { if (p.user) players.push({ id: p.id, user: slimUser(p.user), co: p.co && p.co.state === "ok" ? { items: p.co.items, at: p.co.at } : null }); });
+        const pr = S.party;
+        store.set(CACHE_KEY, JSON.stringify({ t: S.lastOk || Date.now(), party: { name: pr.name, description: pr.description, avatarUrl: pr.avatarUrl, leader: pr.leader, treasurer: pr.treasurer, councilMembers: pr.councilMembers, members: pr.members }, players }));
+      } catch (e) { /* storage full: ignore */ }
+    }, 400);
+  }
+  function loadCache() {
+    const c = store.json(CACHE_KEY, null);
+    if (!c || !c.party || !Array.isArray(c.party.members)) return false;
+    S.party = c.party;
+    S.roles = new Map();
+    const mk = () => ({ leader: false, treasurer: false, council: false });
+    c.party.members.forEach((id) => S.roles.set(id, mk()));
+    const mark = (id, k) => { if (!S.roles.has(id)) S.roles.set(id, mk()); S.roles.get(id)[k] = true; };
+    if (c.party.leader) mark(c.party.leader, "leader");
+    if (c.party.treasurer) mark(c.party.treasurer, "treasurer");
+    (c.party.councilMembers || []).forEach((id) => mark(id, "council"));
+    (c.players || []).forEach((x) => S.players.set(x.id, { id: x.id, user: x.user, error: null, co: x.co ? { state: "ok", items: x.co.items || [], at: x.co.at } : null }));
+    S.cachedAt = c.t || 0;
+    return true;
+  }
 
   // ---------------------------------------------------------------- loading
   async function refresh(manual) {
@@ -219,10 +258,10 @@
     try {
       progress(0, 1, "Loading party...");
       const party = await retry(() => call("party.getById", { partyId: CFG.partyId }));
-      S.party = party;
       if (!party || !Array.isArray(party.members)) {
         throw new ApiError("api", "Unexpected party response (no members list). Keys: " + (party && typeof party === "object" ? Object.keys(party).join(", ") || "none" : typeof party) + ". Open Diagnostics (Ctrl+Shift+D) and copy the report.");
       }
+      S.party = party;
       S.roles = new Map();
       (party.members || []).forEach((id) => S.roles.set(id, { leader: false, treasurer: false, council: false }));
       const mark = (id, k) => { if (!S.roles.has(id)) S.roles.set(id, { leader: false, treasurer: false, council: false }); S.roles.get(id)[k] = true; };
@@ -245,7 +284,8 @@
         } catch (e) {
           if (e.kind === "auth") throw e;
           const p = S.players.get(id) || { id, co: null };
-          p.error = e.message; S.players.set(id, p);
+          if (!p.user) p.error = e.message;   // keep the previous (cached) data if we have it
+          S.players.set(id, p);
         }
       }, (d, t) => { progress(d, t, `Loading players ${d}/${t}`); if (d % 6 === 0) queuePaint(); });
 
@@ -266,6 +306,7 @@
       if (reload.length) await pool(reload, CFG.concurrency, (p) => loadCompanies(p.id, true), (d, t) => progress(d, t, `Refreshing companies ${d}/${t}`));
 
       S.lastOk = Date.now();
+      saveCache();
     } catch (e) {
       handleError(e);
     } finally {
@@ -284,30 +325,27 @@
     if (!quiet) paintOne(id);
     try {
       const d = await retry(() => call("company.getCompanies", { userId: id, perPage: CFG.companiesPerPage }));
-      const ids = (d && d.items) || [];
-      const items = ids.map((cid) => ({ id: typeof cid === "object" && cid ? (cid._id || cid.id) : cid, bonus: null }));
-      await pool(items, 4, async (it) => {
-        try { it.bonus = await retry(() => call("company.getProductionBonus", { companyId: it.id })); }
-        catch (e) { if (e.kind === "auth") throw e; it.err = e.message; }
+      const ids = ((d && d.items) || []).map((c) => (typeof c === "object" && c ? (c._id || c.id) : c));
+      const items = ids.map((cid) => ({ id: cid, itemCode: null, name: null, total: null }));
+      await pool(items, 3, async (it) => {
+        const [info, bonus] = await Promise.allSettled([
+          retry(() => call("company.getById", { companyId: it.id })),
+          retry(() => call("company.getProductionBonus", { companyId: it.id })),
+        ]);
+        if (info.status === "fulfilled" && info.value) { it.itemCode = info.value.itemCode || null; it.name = info.value.name || null; }
+        else if (info.status === "rejected" && info.reason && info.reason.kind === "auth") throw info.reason;
+        if (bonus.status === "fulfilled" && bonus.value) it.total = bonus.value.total != null ? bonus.value.total : null;
+        else if (bonus.status === "rejected" && bonus.reason && bonus.reason.kind === "auth") throw bonus.reason;
+        if (info.status === "rejected" && bonus.status === "rejected") it.err = (info.reason && info.reason.message) || "Failed";
       });
-      p.co = { state: "ok", items };
+      p.co = { state: "ok", items, at: Date.now() };
+      saveCache();
     } catch (e) {
-      if (e.kind === "auth") { handleError(e); p.co = { state: "idle", items: [] }; }
+      if (e.kind === "auth") { handleError(e); p.co = prev && prev.state === "ok" ? prev : { state: "idle", items: [] }; }
+      else if (prev && prev.state === "ok") p.co = prev;              // keep what we already had
       else p.co = { state: "error", items: [], error: e.message };
     }
     if (!quiet) paintOne(id);
-  }
-
-  async function loadAllCompanies() {
-    if (S.bulkCo || S.loading) return;
-    const todo = Array.from(S.players.values()).filter((p) => p.user && !(p.co && p.co.state === "ok"));
-    if (!todo.length) return;
-    S.bulkCo = { d: 0, t: todo.length };
-    paintBar();
-    try {
-      await pool(todo, 3, (p) => loadCompanies(p.id, true), (d, t) => { S.bulkCo.d = d; progress(d, t, `Loading companies ${d}/${t}`); });
-    } catch (e) { handleError(e); }
-    S.bulkCo = null; progress(0, 0); paintAll();
   }
 
   // ---------------------------------------------------------------- errors / notices
@@ -419,9 +457,6 @@
     rb.disabled = S.loading;
     rb.className = "btn pri" + (S.loading ? " spin" : "");
     rb.innerHTML = `${ic("refresh")}<span>${S.loading ? "Refreshing..." : "Refresh"}</span>`;
-    const cb = $("btnLoadCo");
-    cb.disabled = S.loading || !!S.bulkCo || !all.length;
-    cb.innerHTML = `${ic("factory")}<span>${S.bulkCo ? "Loading companies..." : "Load all companies"}</span>`;
     $("btnToken").innerHTML = ic("key");
     paintUpd();
   }
@@ -429,7 +464,11 @@
   function paintUpd() {
     const el = $("upd");
     if (S.loading) { el.textContent = "Updating..."; return; }
-    if (!S.lastOk) { el.textContent = getToken() ? "" : "Token required"; return; }
+    if (!S.lastOk) {
+      if (S.cachedAt) { const m = Math.round((Date.now() - S.cachedAt) / 60000); el.textContent = `Showing saved data from ${m < 60 ? m + "m" : Math.floor(m / 60) + "h"} ago`; }
+      else el.textContent = getToken() ? "" : "Token required";
+      return;
+    }
     const ago = Math.round((Date.now() - S.lastOk) / 1000);
     const next = S.lastStart + CFG.refreshMs - Date.now();
     el.textContent = `Updated ${ago < 60 ? ago + "s" : Math.floor(ago / 60) + "m"} ago · next refresh in ${clock(next)}`;
@@ -494,20 +533,20 @@
       + `</div>`;
   }
 
+  const prettyCode = (c) => { c = String(c || "").replace(/([a-z])([A-Z0-9])/g, "$1 $2").replace(/[_-]+/g, " ").trim(); return c ? c.charAt(0).toUpperCase() + c.slice(1) : "Unknown"; };
+  const itemImg = (code) => `https://media.warera.io/images/itemsv2/${encodeURIComponent(String(code).replace(/\d+$/, ""))}.png?v=2`;
+
   function companiesHtml(p) {
     const co = p.co;
     if (!co || co.state === "idle") return `<button class="btn" type="button" data-co="${esc(p.id)}">${ic("factory")}Load companies</button>`;
-    if (co.state === "loading") return `<div class="load">Loading companies...</div>`;
+    if (co.state === "loading" && !co.items.length) return `<div class="load">Loading companies...</div>`;
     if (co.state === "error") return `<div class="bn">${ic("warn")}<div>${esc(co.error || "Failed")} <button class="btn" type="button" data-co="${esc(p.id)}">Retry</button></div></div>`;
     if (!co.items.length) return `<div class="load">No companies</div>`;
-    return co.items.map((it, i) => {
-      const b = it.bonus || {};
-      const total = b.total != null ? b.total : null;
-      const parts = [["Strategic", b.strategicBonus], ["Deposit", b.depositBonus], ["Ethic spec.", b.ethicSpecializationBonus], ["Ethic deposit", b.ethicDepositBonus]]
-        .filter(([, v]) => v != null).map(([k, v]) => `<span>${k} <b>${v >= 0 ? "+" : ""}${esc(fmtNum(v))}%</b></span>`).join("");
-      return `<div class="card co v-o">${ic("factory")}<div class="co-b"><div class="co-t">Company ${i + 1} <span style="color:var(--faint);font-weight:400">#${esc(String(it.id).slice(-6))}</span></div>
-<div class="co-s">${it.err ? esc(it.err) : parts}</div></div>
-<span class="bonus${total ? "" : " zero"}" title="Production bonus">${total == null ? "-" : "+" + esc(fmtNum(total)) + "%"}</span></div>`;
+    return co.items.map((it) => {
+      const img = it.itemCode ? `<img class="co-img" src="${esc(itemImg(it.itemCode))}" alt="" loading="lazy" onerror="this.style.visibility='hidden'">` : ic("factory");
+      const title = it.err ? esc(it.err) : esc(prettyCode(it.itemCode));
+      return `<div class="card co v-o">${img}<div class="co-b"><div class="co-t">${title}${it.name ? ` <span class="co-n">${esc(it.name)}</span>` : ""}</div></div>
+<span class="bonus${it.total ? "" : " zero"}" title="Production bonus">${it.total == null ? "-" : "+" + esc(fmtNum(it.total)) + "%"}</span></div>`;
     }).join("");
   }
 
@@ -580,7 +619,6 @@
     $("fSort").addEventListener("change", (e) => { S.f.sort = e.target.value; paintList(); });
     $("fType").addEventListener("click", (e) => { const b = e.target.closest("button[data-t]"); if (!b) return; S.f.type = b.dataset.t; paintBar(); paintList(); });
     $("btnRefresh").addEventListener("click", () => refresh(true));
-    $("btnLoadCo").addEventListener("click", loadAllCompanies);
     $("btnToken").addEventListener("click", () => openTokenModal());
 
     const list = $("list");
@@ -743,7 +781,7 @@
     if (!muId) add("first member has no MU - skipped (the app shows 'No MU').");
     else { const d = describe(await rawProbe(base, "mu.getById", { muId }, token)); add(d.text); if (d.data) add("parsed name: " + d.data.name); }
 
-    head("6. company.getCompanies + company.getProductionBonus");
+    head("6. company.getCompanies + company.getById + company.getProductionBonus");
     const rc = describe(await rawProbe(base, "company.getCompanies", { userId: coUser, perPage: CFG.companiesPerPage }, token));
     add(rc.text);
     const items = rc.data && rc.data.items;
@@ -752,7 +790,9 @@
     else {
       add(`items: ${items.length}, first item type ${typeof items[0]}${typeof items[0] === "object" ? " " + shape(items[0]) : ""}`);
       const cid = typeof items[0] === "object" ? (items[0]._id || items[0].id) : items[0];
-      const rb = describe(await rawProbe(base, "company.getProductionBonus", { companyId: cid }, token)); add(rb.text);
+      const ri = describe(await rawProbe(base, "company.getById", { companyId: cid }, token)); add("\n[company.getById]\n" + ri.text);
+      if (ri.data) add("parsed itemCode: " + ri.data.itemCode + (ri.data.name ? " | name: " + ri.data.name : ""));
+      const rb = describe(await rawProbe(base, "company.getProductionBonus", { companyId: cid }, token)); add("\n[company.getProductionBonus]\n" + rb.text);
     }
 
     head("7. App state");
@@ -814,6 +854,7 @@
 
   // ---------------------------------------------------------------- start
   bind();
+  if (loadCache()) paintHero();
   paintAll();
   if (!getToken()) openTokenModal();
   else refresh();
