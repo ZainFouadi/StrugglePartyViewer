@@ -13,7 +13,13 @@
     muTtlMs: 24 * 60 * 60 * 1000,
     defaultBases: ["https://api6.warera.io", "https://api5.warera.io"],
   };
-  const LS = { token: "wr_token", base: "wr_api_base", mu: "wr_mu_cache" };
+  const SORTS = { // key: [default direction, label when desc, label when asc]
+    level: ["desc", "High to low", "Low to high"],
+    mu: ["asc", "Z to A", "A to Z"],
+    wealth: ["desc", "Richest first", "Poorest first"],
+    seen: ["desc", "Newest first", "Oldest first"],
+  };
+    const LS = { token: "wr_token", base: "wr_api_base", mu: "wr_mu_cache" };
 
   const store = {
     get(k, d) { try { const v = localStorage.getItem(k); return v == null ? d : v; } catch (e) { return d; } },
@@ -139,6 +145,47 @@
     if (LOG.length > 40) LOG.shift();
   }
 
+  // ---- rate limiter: the API allows ~100 requests/minute (anonymous) - never exceed it, and wait politely on HTTP 429
+  const RL = { limit: 80, windowMs: 60000, stamps: [], blockedUntil: 0 };
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  function waitLabel(ms) {
+    const box = $("prog");
+    if (!box) return;
+    box.hidden = false;
+    box.lastElementChild.textContent = `Rate limit reached - waiting ${Math.ceil(ms / 1000)}s...`;
+  }
+  async function rlTake() {
+    for (;;) {
+      const now = Date.now();
+      RL.stamps = RL.stamps.filter((t) => now - t < RL.windowMs);
+      if (now < RL.blockedUntil) { waitLabel(RL.blockedUntil - now); await sleep(Math.min(1000, RL.blockedUntil - now)); continue; }
+      if (RL.stamps.length < RL.limit) { RL.stamps.push(now); return; }
+      const wait = RL.stamps[0] + RL.windowMs - now + 50;
+      waitLabel(wait); await sleep(Math.min(1000, wait));
+    }
+  }
+  async function fetchRL(base, proc, input, token, t0) {
+    for (let attempt = 0; attempt < 6; attempt++) {
+      await rlTake();
+      const res = await fetch(`${base}/trpc/${proc}?batch=1`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token },
+        body: JSON.stringify({ "0": input || {} }),
+      });
+      let json; try { json = await res.json(); } catch (e) { json = undefined; }
+      const first = Array.isArray(json) ? json[0] : json;
+      const limited = res.status === 429 || (first && first.status === 429);
+      logCall(proc, base, res.status, t0, limited ? "rate limited" : (json === undefined ? "non-JSON body" : ""));
+      if (!limited) return { res, json };
+      const m = /limit is (\d+)/i.exec((first && first.message) || "");
+      if (m) RL.limit = Math.max(10, Math.floor(Number(m[1]) * 0.8));       // learn the real limit
+      const ra = Number(res.headers.get("retry-after"));
+      RL.blockedUntil = Date.now() + (ra > 0 ? ra * 1000 : 8000 + attempt * 6000);
+      RL.stamps = RL.stamps.concat(Array(Math.max(0, RL.limit - RL.stamps.length)).fill(Date.now())); // window is full: wait it out
+    }
+    throw new ApiError("api", "Rate limit exceeded (HTTP 429). Too many requests - wait a minute and refresh.");
+  }
+
   async function call(proc, input) {
     const token = getToken();
     if (!token) throw new ApiError("auth", "No token");
@@ -146,14 +193,8 @@
     for (const base of bases()) {
       const t0 = performance.now();
       try {
-        const res = await fetch(`${base}/trpc/${proc}?batch=1`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token },
-          body: JSON.stringify({ "0": input || {} }),
-        });
-        let json;
-        try { json = await res.json(); } catch (e) { logCall(proc, base, res.status, t0, "non-JSON body"); throw new ApiError("api", `${proc}: HTTP ${res.status}`); }
-        logCall(proc, base, res.status, t0);
+        const { res, json } = await fetchRL(base, proc, input, token, t0);
+        if (json === undefined) throw new ApiError("api", `${proc}: HTTP ${res.status} (not JSON)`);
         const first = Array.isArray(json) ? json[0] : json;
         if (first && first.error) {
           const msg = (first.error.json && first.error.json.message) || first.error.message || "API error";
@@ -201,12 +242,13 @@
     players: new Map(),        // userId -> {id, user, error, co}
     mu: store.json(LS.mu, {}), // muId -> {name, t}
     open: new Set(),
-    f: { q: "", mu: "all", type: "all", sort: "level" },
+    f: Object.assign({ q: "", mu: "all", type: "all", sort: "level", dir: "desc" }, store.json("wr_sort", {})),
     loading: false,
     lastOk: 0,
     lastStart: 0,
     cachedAt: 0,
   };
+  if (!SORTS[S.f.sort]) { S.f.sort = "level"; S.f.dir = "desc"; } // stale saved choice
 
   // ---------------------------------------------------------------- cache (survives page reloads)
   const CACHE_KEY = "wr_cache_" + CFG.partyId;
@@ -391,14 +433,22 @@
       return true;
     });
     const lvl = (p) => (p.user && p.user.leveling && p.user.leveling.level) || 0;
+    const xp = (p) => (p.user && p.user.leveling && p.user.leveling.totalXp) || 0;
     const seen = (p) => (p.user && p.user.dates && p.user.dates.lastConnectionAt) ? new Date(p.user.dates.lastConnectionAt).getTime() : 0;
     const name = (p) => String((p.user && p.user.username) || "").toLowerCase();
-    const cmp = {
-      level: (a, b) => lvl(b) - lvl(a) || (b.user ? (b.user.leveling || {}).totalXp || 0 : 0) - (a.user ? (a.user.leveling || {}).totalXp || 0 : 0),
-      seen: (a, b) => seen(b) - seen(a),
-      wealth: (a, b) => wealthOf(b.user) - wealthOf(a.user),
-      name: (a, b) => name(a).localeCompare(name(b)),
-    }[f.sort];
+    const mu = (p) => (muName(p) || "");
+    // every comparator is ASCENDING; direction is applied below, ties fall back to name
+    const asc = {
+      level: (a, b) => lvl(a) - lvl(b) || xp(a) - xp(b),
+      seen: (a, b) => seen(a) - seen(b),
+      wealth: (a, b) => wealthOf(a.user) - wealthOf(b.user),
+      mu: (a, b) => mu(a).localeCompare(mu(b)),
+    }[f.sort] || (() => 0);
+    const sign = f.dir === "desc" ? -1 : 1;
+    const cmp = (a, b) => {
+      if (f.sort === "mu") { const ea = !mu(a), eb = !mu(b); if (ea !== eb) return ea ? 1 : -1; } // players without MU always last
+      return sign * asc(a, b) || name(a).localeCompare(name(b));
+    };
     return arr.sort(cmp);
   }
 
@@ -458,6 +508,9 @@
     rb.className = "btn pri" + (S.loading ? " spin" : "");
     rb.innerHTML = `${ic("refresh")}<span>${S.loading ? "Refreshing..." : "Refresh"}</span>`;
     $("btnToken").innerHTML = ic("key");
+    const sd = SORTS[S.f.sort] || SORTS.level;
+    $("fSort").value = S.f.sort;
+    $("fDir").innerHTML = `<span style="display:inline-flex;transform:rotate(${S.f.dir === "desc" ? 90 : -90}deg)">${ic("caret")}</span><span>${S.f.dir === "desc" ? sd[1] : sd[2]}</span>`;
     paintUpd();
   }
 
@@ -616,7 +669,9 @@
   function bind() {
     $("fSearch").addEventListener("input", (e) => { S.f.q = e.target.value; paintList(); });
     $("fMu").addEventListener("change", (e) => { S.f.mu = e.target.value; paintList(); });
-    $("fSort").addEventListener("change", (e) => { S.f.sort = e.target.value; paintList(); });
+    const saveSort = () => store.set("wr_sort", JSON.stringify({ sort: S.f.sort, dir: S.f.dir }));
+    $("fSort").addEventListener("change", (e) => { S.f.sort = e.target.value; S.f.dir = (SORTS[S.f.sort] || SORTS.level)[0]; saveSort(); paintBar(); paintList(); });
+    $("fDir").addEventListener("click", () => { S.f.dir = S.f.dir === "desc" ? "asc" : "desc"; saveSort(); paintBar(); paintList(); });
     $("fType").addEventListener("click", (e) => { const b = e.target.closest("button[data-t]"); if (!b) return; S.f.type = b.dataset.t; paintBar(); paintList(); });
     $("btnRefresh").addEventListener("click", () => refresh(true));
     $("btnToken").addEventListener("click", () => openTokenModal());
@@ -663,6 +718,7 @@
       out.status = res.status;
       out.ms = Math.round(performance.now() - t0);
       out.contentType = res.headers.get("content-type") || "-";
+      out.headers = Array.from(res.headers.keys()).join(", ");
       out.text = await res.text();
       try { out.json = JSON.parse(out.text); } catch (e) { out.parseError = String(e.message || e); }
     } catch (e) {
@@ -677,6 +733,7 @@
     L.push(`- request : POST ${r.base}/trpc/${r.proc}?batch=1   body {"0":${r.input}}`);
     if (r.netError) { L.push(`- RESULT  : NETWORK ERROR after ${r.ms}ms -> ${r.netError}`); return { text: L.join("\n"), data: null }; }
     L.push(`- HTTP    : ${r.status} (${r.ms}ms), content-type ${r.contentType}`);
+    L.push(`- visible response headers: ${r.headers || "-"}`);
     if (r.parseError) { L.push(`- RESULT  : body is not JSON (${r.parseError})`); L.push(`- raw     : ${cut(r.text, 500)}`); return { text: L.join("\n"), data: null }; }
     const first = Array.isArray(r.json) ? r.json[0] : r.json;
     L.push(`- envelope: ${Array.isArray(r.json) ? "array(" + r.json.length + ")" : typeof r.json} -> first = ${shape(first)}`);
@@ -723,6 +780,8 @@
         if (pl.exp) exp = new Date(pl.exp * 1000).toISOString() + (Date.now() > pl.exp * 1000 ? "  <-- EXPIRED" : "  (valid)");
       } catch (e) { exp = "not a decodable JWT"; }
       add(`token     : present, ${token.length} chars, alg ${alg}, payload keys [${keys}], exp ${exp}   (value is never printed)`);
+      const dots = (token.match(/\./g) || []).length;
+      add(`token shape: ${dots} dot(s) (a normal JWT has 2 and is usually 150+ chars), charset ${/^[A-Za-z0-9._-]+$/.test(token) ? "url-safe" : "CONTAINS UNUSUAL CHARACTERS (quotes/spaces/newline?)"}, ${/^[0-9a-f]+$/i.test(token) ? "looks like a hex string, not a JWT" : "not pure hex"}`);
     }
     if (!token) { add("\nStop: no token saved. Save one with the key button, then re-run."); return R.join("\n"); }
 
@@ -746,6 +805,7 @@
       add("\nVERDICT: party request failed.");
       add("  - 'NETWORK ERROR' while the ping above says reachable  => CORS block: deploy worker.js and set API base.");
       add("  - HTTP 401 / UNAUTHORIZED => token invalid or expired.");
+      add("  - HTTP 429 'anonymous limit' => the server does NOT recognise your token (treated as anonymous, 100 req/min). Re-copy a full valid token. Otherwise just wait a minute.");
       return R.join("\n");
     }
     const mem = party.members;
@@ -800,6 +860,7 @@
     const bad = Array.from(S.players.values()).filter((p) => p.error);
     add(`players that failed to load: ${bad.length}`);
     bad.slice(0, 8).forEach((p) => add(`  - ${p.id}: ${p.error}`));
+    add(`rate limiter: limit ${RL.limit}/min, requests in last minute ${RL.stamps.filter((t) => Date.now() - t < 60000).length}`);
     add(`filters: ${JSON.stringify(S.f)}`);
     add(`open rows: ${S.open.size}`);
 
