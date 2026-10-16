@@ -148,12 +148,7 @@
   // ---- rate limiter: the API allows ~100 requests/minute (anonymous) - never exceed it, and wait politely on HTTP 429
   const RL = { limit: 80, windowMs: 60000, stamps: [], blockedUntil: 0 };
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-  function waitLabel(ms) {
-    const box = $("prog");
-    if (!box) return;
-    box.hidden = false;
-    box.lastElementChild.textContent = `Rate limit reached - waiting ${Math.ceil(ms / 1000)}s...`;
-  }
+  function waitLabel() { /* waiting for the rate limit is silent - nothing is shown to the visitor */ }
   async function rlTake() {
     for (;;) {
       const now = Date.now();
@@ -406,7 +401,7 @@
 
   function progress(d, t, label) {
     const box = $("prog");
-    if (!t) { box.hidden = true; return; }
+    if (!t || !S.loading) { box.hidden = true; return; }   // only visible while the main refresh runs
     box.hidden = false;
     box.firstElementChild.style.width = Math.round((d / t) * 100) + "%";
     box.lastElementChild.textContent = label || "";
